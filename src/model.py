@@ -86,7 +86,7 @@ class CustomEncryptedKeyring:
         if service not in self.data:
             self.data[service] = {}
         self.data[service][username] = password
-        self._save_data()
+        self._save_data()  # This ensures the data is saved after each set_password operation
         logging.info(f"Password set for {username} in {service}")
 
     def get_password(self, service: str, username: str) -> Optional[str]:
@@ -115,16 +115,26 @@ def main() -> None:
     # Set a password
     keyring.set_password('MyService', 'MyUsername', 'MySecurePassword')
 
-    # Get the password
-    retrieved_password: Optional[str] = keyring.get_password('MyService', 'MyUsername')
-    print(f"Retrieved password: {retrieved_password}")
+    # Set another password to demonstrate multiple entries
+    keyring.set_password('AnotherService', 'AnotherUser', 'AnotherPassword')
 
-    # Delete the password
+    # Get the passwords
+    retrieved_password1: Optional[str] = keyring.get_password('MyService', 'MyUsername')
+    print(f"Retrieved password for MyService: {retrieved_password1}")
+
+    retrieved_password2: Optional[str] = keyring.get_password('AnotherService', 'AnotherUser')
+    print(f"Retrieved password for AnotherService: {retrieved_password2}")
+
+    # Delete a password
     keyring.delete_password('MyService', 'MyUsername')
 
     # Try to retrieve the deleted password
     deleted_password: Optional[str] = keyring.get_password('MyService', 'MyUsername')
     print(f"Deleted password (should be None): {deleted_password}")
+
+    # The other password should still be there
+    still_there: Optional[str] = keyring.get_password('AnotherService', 'AnotherUser')
+    print(f"Password that should still be there: {still_there}")
 
 if __name__ == "__main__":
     main()
