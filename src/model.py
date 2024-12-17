@@ -1,26 +1,23 @@
 import os
-import yaml
+import json
 import base64
 import logging
 from getpass import getpass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class CustomEncryptedKeyring:
-    """
-    A custom keyring backend that uses YAML for data storage and encryption for security.
-    """
-
-    def __init__(self, filename: str = 'custom_keyring.yaml'):
+class SecureKeyring:
+    def __init__(self, filename: str = 'secure_keyring.json'):
         self.filename: str = filename
-        self.key: Optional[bytes] = None
-        self.data: Dict[str, Dict[str, str]] = {}
+        self.master_key: Optional[bytes] = None
+        self.fernet: Optional[Fernet] = None
+        self.data: Dict[str, str] = {}
 
-    def _derive_key(self, password: str, salt: Optional[bytes] = None) -> Tuple[bytes, bytes]:
+    def _derive_key(self, password: str, salt: Optional[bytes] = None) -> tuple[bytes, bytes]:
         if salt is None:
             salt = os.urandom(16)
         kdf = PBKDF2HMAC(
@@ -32,110 +29,114 @@ class CustomEncryptedKeyring:
         key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
         return key, salt
 
-    def _load_data(self) -> None:
-        if not os.path.exists(self.filename):
-            logging.info(f"Keyring file {self.filename} not found. Creating a new one.")
-            self._save_data()
-            return
+    def _initialize_fernet(self, master_password: str) -> None:
+        salt = self._load_salt()
+        if salt is None:
+            self.master_key, salt = self._derive_key(master_password)
+            self._save_salt(salt)
+        else:
+            self.master_key, _ = self._derive_key(master_password, salt)
+        self.fernet = Fernet(self.master_key)
 
-        try:
+    def _load_salt(self) -> Optional[bytes]:
+        if os.path.exists(self.filename):
             with open(self.filename, 'r') as file:
-                encrypted_data: Dict[str, str] = yaml.safe_load(file)
+                data = json.load(file)
+                return base64.b64decode(data.get('salt', ''))
+        return None
 
-            if not encrypted_data:
-                logging.warning(f"Keyring file {self.filename} is empty. Initializing with empty data.")
-                self._save_data()
-                return
+    def _save_salt(self, salt: bytes) -> None:
+        data = {'salt': base64.b64encode(salt).decode(), 'data': {}}
+        with open(self.filename, 'w') as file:
+            json.dump(data, file)
 
-            if self.key is None:
-                password = getpass("Enter the master password to unlock the keyring: ")
-                self.key, _ = self._derive_key(password, base64.b64decode(encrypted_data['salt']))
-
-            f = Fernet(self.key)
-            decrypted_data = f.decrypt(encrypted_data['data'].encode())
-            self.data = yaml.safe_load(decrypted_data)
-        except Exception as e:
-            logging.error(f"Error loading keyring data: {str(e)}")
-            self.data = {}
+    def _load_data(self) -> None:
+        if os.path.exists(self.filename):
+            with open(self.filename, 'r') as file:
+                data = json.load(file)
+                encrypted_data = data.get('data', {})
+                for key, value in encrypted_data.items():
+                    try:
+                        decrypted_value = self.fernet.decrypt(value.encode()).decode()
+                        self.data[key] = decrypted_value
+                    except Exception as e:
+                        logging.error(f"Error decrypting data for {key}: {str(e)}")
 
     def _save_data(self) -> None:
-        try:
-            if self.key is None:
-                password = getpass("Set a master password for the keyring: ")
-                self.key, salt = self._derive_key(password)
-            else:
-                _, salt = self._derive_key(Fernet(self.key).extract_timestamp().to_bytes(8, 'big').decode())
-
-            f = Fernet(self.key)
-            encrypted_data = f.encrypt(yaml.dump(self.data).encode())
-            
-            data_to_save: Dict[str, str] = {
-                'salt': base64.b64encode(salt).decode(),
-                'data': encrypted_data.decode()
-            }
-
-            with open(self.filename, 'w') as file:
-                yaml.dump(data_to_save, file)
-            
-            logging.info(f"Keyring data saved to {self.filename}")
-        except Exception as e:
-            logging.error(f"Error saving keyring data: {str(e)}")
+        encrypted_data = {}
+        for key, value in self.data.items():
+            encrypted_value = self.fernet.encrypt(value.encode()).decode()
+            encrypted_data[key] = encrypted_value
+        
+        with open(self.filename, 'r+') as file:
+            data = json.load(file)
+            data['data'] = encrypted_data
+            file.seek(0)
+            json.dump(data, file)
+            file.truncate()
 
     def set_password(self, service: str, username: str, password: str) -> None:
+        if self.fernet is None:
+            master_password = getpass("Enter the master password: ")
+            self._initialize_fernet(master_password)
+        
         self._load_data()
-        if service not in self.data:
-            self.data[service] = {}
-        self.data[service][username] = password
-        self._save_data()  # This ensures the data is saved after each set_password operation
+        self.data[f"{service}:{username}"] = password
+        self._save_data()
         logging.info(f"Password set for {username} in {service}")
 
     def get_password(self, service: str, username: str) -> Optional[str]:
+        if self.fernet is None:
+            master_password = getpass("Enter the master password: ")
+            self._initialize_fernet(master_password)
+        
         self._load_data()
-        password = self.data.get(service, {}).get(username)
+        password = self.data.get(f"{service}:{username}")
         if password:
             logging.info(f"Password retrieved for {username} in {service}")
+            return password
         else:
             logging.info(f"No password found for {username} in {service}")
-        return password
+            return None
 
     def delete_password(self, service: str, username: str) -> None:
+        if self.fernet is None:
+            master_password = getpass("Enter the master password: ")
+            self._initialize_fernet(master_password)
+        
         self._load_data()
-        if service in self.data and username in self.data[service]:
-            del self.data[service][username]
-            if not self.data[service]:
-                del self.data[service]
+        key = f"{service}:{username}"
+        if key in self.data:
+            del self.data[key]
             self._save_data()
             logging.info(f"Password deleted for {username} in {service}")
         else:
             logging.info(f"No password found to delete for {username} in {service}")
 
-def main() -> None:
-    keyring = CustomEncryptedKeyring()
+def main():
+    keyring = SecureKeyring()
 
-    # Set a password
+    # Set passwords
     keyring.set_password('MyService', 'MyUsername', 'MySecurePassword')
-
-    # Set another password to demonstrate multiple entries
     keyring.set_password('AnotherService', 'AnotherUser', 'AnotherPassword')
 
     # Get the passwords
-    retrieved_password1: Optional[str] = keyring.get_password('MyService', 'MyUsername')
+    retrieved_password1 = keyring.get_password('MyService', 'MyUsername')
     print(f"Retrieved password for MyService: {retrieved_password1}")
 
-    retrieved_password2: Optional[str] = keyring.get_password('AnotherService', 'AnotherUser')
+    retrieved_password2 = keyring.get_password('AnotherService', 'AnotherUser')
     print(f"Retrieved password for AnotherService: {retrieved_password2}")
 
     # Delete a password
     keyring.delete_password('MyService', 'MyUsername')
 
     # Try to retrieve the deleted password
-    deleted_password: Optional[str] = keyring.get_password('MyService', 'MyUsername')
+    deleted_password = keyring.get_password('MyService', 'MyUsername')
     print(f"Deleted password (should be None): {deleted_password}")
 
     # The other password should still be there
-    still_there: Optional[str] = keyring.get_password('AnotherService', 'AnotherUser')
+    still_there = keyring.get_password('AnotherService', 'AnotherUser')
     print(f"Password that should still be there: {still_there}")
 
 if __name__ == "__main__":
     main()
-
